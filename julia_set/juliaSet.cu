@@ -113,6 +113,7 @@ int main() {
     d_indices = h_indices_temp; // Copy indices to device
 
     // 2. Calculate Julia Set on GPU via Thrust::transform
+    // Link: https://nvidia.github.io/cccl/thrust/api/group__transformations_1gabbda6380c902223d777cc72d3b1b9d1a.html
     // The device iterators implicitly select the thrust::device execution policy
     thrust::transform(d_indices.begin(), d_indices.end(), 
                       d_julia_values.begin(), julia_functor(DIM));
