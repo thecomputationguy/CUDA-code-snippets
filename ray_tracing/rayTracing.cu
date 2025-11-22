@@ -10,9 +10,9 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include <numeric>
-#include <time.h>
+#include <time.h> // For srand and time
 
-// --- Constants & Global Definitions ---
+// --- Global Constants and Error Handling ---
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -27,82 +27,75 @@
 #define SPHERES 20
 #define INF 2e10f
 
-// --- Sphere Structure and Device Method (from Chapter 6) ---
-
+// --- Sphere Structure and Device Method ---
 struct Sphere {
-    float r, g, b;      // Color components
+    float r, g, b;
     float radius;
-    float x, y, z;      // Center coordinates
+    float x, y, z;
 
-    // __device__ method to calculate intersection point (t) and normal (n)
     __device__ float hit(float ox, float oy, float *n) const {
         float dx = ox - x;
         float dy = oy - y;
 
         if (dx * dx + dy * dy < radius * radius) {
             float dz = sqrtf(radius * radius - dx * dx - dy * dy);
-            // This 'n' is used for shading scale in the original code, 
-            // representing depth/radius for shading (0 to 1).
-            *n = dz / sqrtf(radius * radius); 
-            return dz + z; // Return depth (z + dz)
+            *n = dz / sqrtf(radius * radius);
+            return dz + z;
         }
-        return -INF; // No hit
+        return -INF;
     }
 };
 
-// --- RayTracer Functor (The Kernel Logic) ---
-// This functor will be executed once per pixel by thrust::transform.
+// --- Constant Memory Declaration (Low-level CUDA) ---
+// This array is globally accessible to all device code (functors/kernels).
+__constant__ Sphere d_spheres[SPHERES];
+
+
+// --- RayTracer Functor (Execution Logic) ---
+// This functor accesses the scene data directly via the globally defined __constant__ array.
 
 struct raytracer_functor {
-    // We pass the entire Sphere array via a raw device pointer (C-style array captured by value)
-    Sphere* d_spheres;
+    // Note: It only captures DIM and SPHERE count, NOT the sphere data pointer itself.
     const int num_spheres;
     const int dim;
 
-    __host__ __device__ raytracer_functor(Sphere* spheres, int count, int d)
-        : d_spheres(spheres), num_spheres(count), dim(d) {}
+    __host__ __device__ raytracer_functor(int count, int d)
+        : num_spheres(count), dim(d) {}
 
-    // Operator to apply the ray-tracing calculation logic to a single linear index
     __device__ unsigned char operator()(int offset) const {
-        // 1. Map linear offset to pixel coordinates (x, y)
+        
+        // 1. Map linear offset to coordinates
         int x = offset % dim;
         int y = offset / dim;
 
-        // 2. Map pixel coordinates to world coordinates (ox, oy)
+        // 2. Map coordinates to world coordinates (ox, oy)
         float ox = (float)(x - dim / 2);
         float oy = (float)(y - dim / 2);
 
-        float r = 0.0f, g = 0.0f, b = 0.0f;
-        float maxz = -INF; // Tracks the closest object hit
+        float r = 0.0f; 
+        float maxz = -INF;
 
-        // 3. Iterate through all spheres (The core ray tracing loop)
+        // 3. Ray Tracing Loop over Spheres 
+        // Accesses the global __constant__ array defined earlier.
         for (int i = 0; i < num_spheres; i++) {
-            // Access the sphere data using the device pointer
-            Sphere s = d_spheres[i]; 
-            float n; // Stores the calculated depth/shading factor
-            
-            // Check for intersection
+            Sphere s = d_spheres[i]; // DIRECT ACCESS to constant memory
+            float n; 
             float t = s.hit(ox, oy, &n); 
 
-            // If a hit occurred and it's closer than the current closest object
             if (t > maxz) {
-                // Update closest object and color
                 maxz = t;
                 float fscale = n; 
-                r = s.r * fscale;
-                g = s.g * fscale;
-                b = s.b * fscale;
+                // Only saving R channel for grayscale output
+                r = s.r * fscale; 
             }
         }
         
-        // 4. Color Mapping to Single Byte (Grayscale)
-        // Since we are only saving a PPM, we'll convert the color result to a single grayscale byte (0-255).
-        // The original code used 4 bytes for RGBA, this simplifies output to 3 bytes (RGB) in PPM.
-        return (unsigned char)(r * 255.0f); // Use R channel as grayscale output
+        // 4. Color Mapping (Store Grayscale result)
+        return (unsigned char)(r * 255.0f);
     }
 };
 
-// --- PPM File Saving Function (Accepts std::vector) ---
+// --- PPM File Saving Function (Host Code) ---
 void save_ppm_file(const std::vector<unsigned char>& image_data_gs, 
                    int width, int height, const char* filename) {
     
@@ -117,8 +110,7 @@ void save_ppm_file(const std::vector<unsigned char>& image_data_gs,
     file << width << " " << height << "\n";
     file << 255 << "\n";
 
-    // Write Raw Pixel Data (RGB)
-    // Since the image_data is grayscale (1 byte per pixel), we write R, G, B as the same value.
+    // Write Raw Pixel Data (RGB: Grayscale = R=G=B)
     for (int i = 0; i < width * height; ++i) {
         unsigned char gs_value = image_data_gs[i];
         file.put(gs_value); // R
@@ -129,22 +121,23 @@ void save_ppm_file(const std::vector<unsigned char>& image_data_gs,
     file.close();
 }
 
-// --- Main Application Logic with Thrust ---
-int main() {
-    CUDA_CHECK(cudaSetDevice(0));
 
-    // --- 0. Timing Setup ---
+// --- Main Application Logic with CUDA Timing ---
+int main() {
+    // 1. Setup CUDA Context and Events
+    CUDA_CHECK(cudaSetDevice(0));
+    
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
     float elapsedTime;
-
-    const int N = DIM * DIM;
     
-    // --- 1. Host Scene Setup ---
+    // 2. Host Scene Setup and Initialization
+    const int PIXEL_COUNT = DIM * DIM;
     std::vector<Sphere> h_spheres(SPHERES);
+    std::vector<unsigned char> h_grayscale_output(PIXEL_COUNT);
     
-    // Random number generator setup (using host logic from Chapter 6)
+    srand(static_cast<unsigned int>(time(0)));
     auto rnd = [](float x) { return x * rand() / RAND_MAX; };
 
     for (int i = 0; i < SPHERES; i++) {
@@ -157,58 +150,51 @@ int main() {
         h_spheres[i].radius = rnd(100.0f) + 20;
     }
 
-    // --- 2. Device Setup and Data Transfer (Scene Data) ---
-    
-    // Use thrust::device_vector to manage the sphere data (which is constant for the kernel run)
-    thrust::device_vector<Sphere> d_spheres_vector = h_spheres;
-    // Get a raw pointer to the device memory for the functor to capture
-    Sphere* d_spheres_ptr = thrust::raw_pointer_cast(d_spheres_vector.data());
-
-
-    // --- 3. Execution Setup ---
-    
+    // 3. Device Memory Setup (Input Indices and Output Buffer)
     // Input indices: 0, 1, 2, ... N-1
-    thrust::device_vector<int> d_indices(N);
-    std::vector<int> h_indices_temp(N);
+    thrust::device_vector<int> d_indices(PIXEL_COUNT);
+    std::vector<int> h_indices_temp(PIXEL_COUNT);
     std::iota(h_indices_temp.begin(), h_indices_temp.end(), 0);
     d_indices = h_indices_temp; 
     
-    // Output: 1 byte per pixel (Grayscale R channel)
-    thrust::device_vector<unsigned char> d_grayscale_output(N);
+    unsigned char *d_grayscale_output;
+    CUDA_CHECK(cudaMalloc((void**)&d_grayscale_output, PIXEL_COUNT * sizeof(unsigned char)));
+    
+    // 4. Transfer Scene Data to __constant__ Memory (LOW-LEVEL CUDA)
+    // This is the manual step to populate the specialized memory space.
+    CUDA_CHECK(cudaMemcpyToSymbol(d_spheres, h_spheres.data(), SPHERES * sizeof(Sphere)));
 
-    // Start timing
-    std::cout << "Starting ray tracing on GPU (" << DIM << "x" << DIM << " pixels)..." << std::endl;
-    float totalTime;
+    // 5. Start Timer
     CUDA_CHECK(cudaEventRecord(start, 0));
 
-    // Create the functor, capturing the device pointer to the sphere data
-    raytracer_functor tracer(d_spheres_ptr, SPHERES, DIM);
+    // 6. Kernel Execution via Thrust::transform
+    raytracer_functor tracer(SPHERES, DIM);
     
-    // 4. Execute Ray Tracing via Thrust::transform
-    // The device iterators implicitly determine the execution policy.
-
     thrust::transform(d_indices.begin(), d_indices.end(), 
-                      d_grayscale_output.begin(), tracer);
+                      thrust::device_ptr<unsigned char>(d_grayscale_output), 
+                      tracer);
 
-    // Stop timing
     // 7. Stop Timer and Synchronize
     CUDA_CHECK(cudaEventRecord(stop, 0)); 
     CUDA_CHECK(cudaEventSynchronize(stop)); 
-    CUDA_CHECK(cudaEventElapsedTime(&totalTime, start, stop));
+    CUDA_CHECK(cudaEventElapsedTime(&elapsedTime, start, stop)); // Calculate elapsed time
 
-    // 5. Transfer Results back to Host
-    thrust::host_vector<unsigned char> h_grayscale_output = d_grayscale_output;
+    // 8. Transfer Results Back to Host
+    CUDA_CHECK(cudaMemcpy(h_grayscale_output.data(), d_grayscale_output, 
+                          PIXEL_COUNT * sizeof(unsigned char), cudaMemcpyDeviceToHost));
+
+    // 9. Final Output and Cleanup
     
-    // Convert to standard vector for file saving
-    std::vector<unsigned char> h_output_for_file(h_grayscale_output.begin(), h_grayscale_output.end());
-
-    // 6. Save Final Output
     const char* filename = "raytracer_output.ppm";
-    save_ppm_file(h_output_for_file, DIM, DIM, filename); 
+    save_ppm_file(h_grayscale_output, DIM, DIM, filename); 
 
     std::cout << "Ray tracing complete." << std::endl;
-    std::cout << "Time to compute on GPU: " << totalTime << " ms" << std::endl;
+    std::cout << "Time to compute on GPU: " << elapsedTime << " ms" << std::endl;
     std::cout << "Output saved successfully to: " << filename << std::endl;
+    
+    CUDA_CHECK(cudaFree(d_grayscale_output));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
     
     return 0;
 }
