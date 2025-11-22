@@ -1,15 +1,16 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/transform.h>
-#include <thrust/functional.h>
 #include <thrust/fill.h>
-#include <thrust/count.h>
+#include <thrust/count.h> 
+#include <thrust/functional.h>
 #include <cmath>
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <cuda_runtime.h>
 #include <numeric>
+#include <time.h>
 
 // --- Constants & Global Definitions ---
 #define CUDA_CHECK(call) \
@@ -22,7 +23,7 @@
         } \
     } while (0)
 
-#define DIM 512
+#define DIM 4096
 #define SPHERES 20
 #define INF 2e10f
 
@@ -131,6 +132,13 @@ void save_ppm_file(const std::vector<unsigned char>& image_data_gs,
 // --- Main Application Logic with Thrust ---
 int main() {
     CUDA_CHECK(cudaSetDevice(0));
+
+    // --- 0. Timing Setup ---
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    float elapsedTime;
+
     const int N = DIM * DIM;
     
     // --- 1. Host Scene Setup ---
@@ -168,15 +176,25 @@ int main() {
     // Output: 1 byte per pixel (Grayscale R channel)
     thrust::device_vector<unsigned char> d_grayscale_output(N);
 
+    // Start timing
+    std::cout << "Starting ray tracing on GPU (" << DIM << "x" << DIM << " pixels)..." << std::endl;
+    float totalTime;
+    CUDA_CHECK(cudaEventRecord(start, 0));
+
     // Create the functor, capturing the device pointer to the sphere data
     raytracer_functor tracer(d_spheres_ptr, SPHERES, DIM);
     
     // 4. Execute Ray Tracing via Thrust::transform
     // The device iterators implicitly determine the execution policy.
-    std::cout << "Starting ray tracing on GPU (" << DIM << "x" << DIM << " pixels)..." << std::endl;
 
     thrust::transform(d_indices.begin(), d_indices.end(), 
                       d_grayscale_output.begin(), tracer);
+
+    // Stop timing
+    // 7. Stop Timer and Synchronize
+    CUDA_CHECK(cudaEventRecord(stop, 0)); 
+    CUDA_CHECK(cudaEventSynchronize(stop)); 
+    CUDA_CHECK(cudaEventElapsedTime(&totalTime, start, stop));
 
     // 5. Transfer Results back to Host
     thrust::host_vector<unsigned char> h_grayscale_output = d_grayscale_output;
@@ -189,6 +207,7 @@ int main() {
     save_ppm_file(h_output_for_file, DIM, DIM, filename); 
 
     std::cout << "Ray tracing complete." << std::endl;
+    std::cout << "Time to compute on GPU: " << totalTime << " ms" << std::endl;
     std::cout << "Output saved successfully to: " << filename << std::endl;
     
     return 0;
